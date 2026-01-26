@@ -29,7 +29,7 @@ PMAS follows a modular and layered architecture consisting of:
 - Predictive failure detection  
 - Automated maintenance alerts  
 - Continuous system monitoring  
-- Data-driven decision support  
+- Data driven decision support  
 - Scalable and modular design  
 
 ---
