@@ -151,6 +151,13 @@ class DataPreprocessor:
         else:
             df[self.feature_columns] = self.scalers['features'].transform(df[self.feature_columns])
         
+        # Scale RUL for training
+        if is_training:
+            self.scalers['rul'] = StandardScaler()
+            df['rul_scaled'] = self.scalers['rul'].fit_transform(df[['rul']])
+        else:
+            df['rul_scaled'] = self.scalers['rul'].transform(df[['rul']])
+            
         return df
     
     def _calculate_rul(self, df):
@@ -166,6 +173,7 @@ class DataPreprocessor:
         # and equipment degradation indicators
         
         MAINTENANCE_CYCLE = 168  # hours (1 week)
+        MIN_RUL = 1.0  # Minimum RUL to avoid division by zero (1 hour)
         
         # Basic RUL: time until next scheduled maintenance
         df['rul_basic'] = MAINTENANCE_CYCLE - df['time_since_last_maintenance']
@@ -179,8 +187,8 @@ class DataPreprocessor:
         )
         
         # Adjust RUL based on degradation
-        df['rul'] = df['rul_basic'] * (1 - df['degradation_score'] * 0.5)
-        df['rul'] = df['rul'].clip(lower=0)
+        df['rul'] = df['rul_basic'] * (1 - df['degradation_score'] * 0.3)
+        df['rul'] = df['rul'].clip(lower=MIN_RUL)
         
         # Health status: Good (>120h), Warning (60-120h), Critical (<60h)
         df['health_status'] = pd.cut(df['rul'], 
@@ -189,6 +197,9 @@ class DataPreprocessor:
         
         return df
 
+    def inverse_transform_rul(self, rul_scaled):
+        """Convert scaled RUL back to original scale"""
+        return self.scalers['rul'].inverse_transform(rul_scaled.reshape(-1, 1)).flatten()
 
 class TimeSeriesDataset(Dataset):
     """PyTorch Dataset for time series sequences"""
@@ -218,7 +229,7 @@ class TimeSeriesDataset(Dataset):
             
             # Extract features and targets
             features = machine_data[feature_columns].values
-            rul_values = machine_data['rul'].values
+            rul_values = machine_data['rul_scaled'].values
             
             # Create sequences
             for i in range(len(features) - sequence_length - prediction_horizon + 1):
@@ -435,7 +446,7 @@ def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001)
             # Combined loss: MSE for main prediction + quantile loss
             loss_mse = mse_loss(predictions, targets)
             loss_quantile = quantile_loss(quantiles, targets)
-            loss = loss_mse + 0.1 * loss_quantile
+            loss = loss_mse + 0.05 * loss_quantile
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -488,7 +499,7 @@ def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001)
     return train_losses, val_losses
 
 
-def predict_with_uncertainty(model, data_loader):
+def predict_with_uncertainty(model, data_loader, preprocessor):
     """Make predictions with uncertainty bounds"""
     model.eval()
     predictions = []
@@ -510,7 +521,17 @@ def predict_with_uncertainty(model, data_loader):
             uncertainties.extend(uncertainty)
             targets_list.extend(targets.numpy())
     
-    return np.array(predictions), np.array(uncertainties), np.array(targets_list)
+    predictions = np.array(predictions)
+    targets_list = np.array(targets_list)
+    
+    # Inverse transform predictions and targets back to original scale
+    predictions = preprocessor.inverse_transform_rul(predictions)
+    targets_list = preprocessor.inverse_transform_rul(targets_list)
+    
+    rul_std = np.sqrt(preprocessor.scalers['rul'].var_[0])
+    uncertainties = np.array(uncertainties) * rul_std
+    
+    return predictions, uncertainties, targets_list
 
 
 def calculate_health_status(rul):

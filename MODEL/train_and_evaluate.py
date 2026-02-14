@@ -3,6 +3,7 @@ Training and Evaluation Script for Predictive Maintenance TFT Model
 Complete pipeline from data loading to prediction
 """
 
+import os
 import pandas as pd
 import numpy as np
 import torch
@@ -100,11 +101,20 @@ def prepare_datasets(train_df, val_df, test_df, sequence_length=24, prediction_h
 def create_dataloaders(train_dataset, val_dataset, test_dataset, batch_size=32):
     """Create PyTorch DataLoaders"""
     
-    # MPS-optimized: use pin_memory=False for MPS, True for CUDA
-    pin_memory = torch.cuda.is_available()
-    
-    # Determine optimal number of workers for Mac
-    num_workers = 0 if DEVICE.type == 'mps' else 2
+    if DEVICE.type == 'cuda':
+        # GPU optimization
+        pin_memory = True
+        print(f"🚀 GPU detected: Using {num_workers} workers and pin_memory=True for optimal performance")
+    elif DEVICE.type == 'mps':
+        # Mac M1/M2/M3 optimization
+        pin_memory = False
+        num_workers = 0
+        print(f"🍎 MPS detected: Using {num_workers} workers (MPS doesn't support multi-process)")
+    else:
+        # CPU fallback
+        pin_memory = False
+        num_workers = 4
+        print(f"💻 CPU detected: Using {num_workers} workers")
     
     train_loader = DataLoader(
         train_dataset, 
@@ -138,26 +148,44 @@ def evaluate_model(model, test_loader, preprocessor):
     
     print("\n📊 Evaluating model on test set...")
     
-    predictions, uncertainties, targets = predict_with_uncertainty(model, test_loader)
+    predictions, uncertainties, targets = predict_with_uncertainty(model, test_loader, preprocessor)
     
     # Calculate metrics
     mae = np.mean(np.abs(predictions.flatten() - targets.flatten()))
     rmse = np.sqrt(np.mean((predictions.flatten() - targets.flatten()) ** 2))
-    mape = np.mean(np.abs((predictions.flatten() - targets.flatten()) / (targets.flatten() + 1e-6))) * 100
     
+    threshold = 10.0  # Only calculate MAPE for RUL > 10 hours
+    mask = targets.flatten() > threshold
+    
+    if mask.sum() > 0:
+        mape = np.mean(np.abs((predictions.flatten()[mask] - targets.flatten()[mask]) / targets.flatten()[mask])) * 100
+    else:
+        mape = np.nan
+        
     # R-squared
     ss_res = np.sum((targets.flatten() - predictions.flatten()) ** 2)
     ss_tot = np.sum((targets.flatten() - np.mean(targets.flatten())) ** 2)
     r2 = 1 - (ss_res / ss_tot)
     
+    median_ae = np.median(np.abs(predictions.flatten() - targets.flatten()))
+    
     print("\n" + "="*60)
     print("MODEL PERFORMANCE METRICS")
     print("="*60)
     print(f"Mean Absolute Error (MAE): {mae:.2f} hours")
+    print(f"Median Absolute Error: {median_ae:.2f} hours")
     print(f"Root Mean Squared Error (RMSE): {rmse:.2f} hours")
-    print(f"Mean Absolute Percentage Error (MAPE): {mape:.2f}%")
+    if not np.isnan(mape):
+        print(f"Mean Absolute Percentage Error (MAPE): {mape:.2f}%")
+        print(f"  (calculated for RUL > {threshold} hours, {mask.sum()} samples)")
+    else:
+        print(f"MAPE: N/A (all RUL values below {threshold} hours)")
     print(f"R-squared (R²): {r2:.4f}")
     print(f"Average Uncertainty: {np.mean(uncertainties):.2f} hours")
+    print(f"\nTarget RUL Statistics:")
+    print(f"  Min: {targets.min():.2f} hours")
+    print(f"  Mean: {targets.mean():.2f} hours")
+    print(f"  Max: {targets.max():.2f} hours")
     print("="*60 + "\n")
     
     return predictions, uncertainties, targets
@@ -165,6 +193,8 @@ def evaluate_model(model, test_loader, preprocessor):
 
 def plot_results(predictions, targets, uncertainties, save_path='prediction_results.png'):
     """Plot prediction results"""
+    
+    print(f"\n📊 Generating prediction plots...")
     
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     
@@ -202,9 +232,26 @@ def plot_results(predictions, targets, uncertainties, save_path='prediction_resu
     axes[1, 1].set_title('Uncertainty vs Absolute Error')
     axes[1, 1].grid(True, alpha=0.3)
     
+    # Add correlation info
+    if len(uncertainties) > 1 and np.std(uncertainties) > 0:
+        corr = np.corrcoef(uncertainties, abs_errors)[0, 1]
+        axes[1, 1].text(0.05, 0.95, f'Correlation: {corr:.3f}', 
+                       transform=axes[1, 1].transAxes, 
+                       verticalalignment='top',
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
     plt.tight_layout()
+    save_path = os.path.abspath(save_path)
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig) 
+    
     print(f"✓ Results plot saved to: {save_path}")
+    
+    if os.path.exists(save_path):
+        file_size = os.path.getsize(save_path) / 1024  # KB
+        print(f"  File size: {file_size:.1f} KB")
+    else:
+        print(f"⚠️  WARNING: Plot file was not created at {save_path}")
     
     return fig
 
@@ -216,12 +263,17 @@ def generate_maintenance_report(model, test_df, preprocessor, sequence_length=24
     print("="*60)
     
     report_data = []
+    skip_reasons = []
+    machines_processed = 0
+    machines_skipped = 0
     
     for machine_id in test_df['machine_id'].unique():
         # Get latest data for this machine
         machine_data = test_df[test_df['machine_id'] == machine_id].sort_values('timestamp')
         
         if len(machine_data) < sequence_length:
+            machines_skipped += 1
+            skip_reasons.append(f"Machine {machine_id}: Insufficient data ({len(machine_data)} < {sequence_length})")
             continue
         
         # Get last sequence
@@ -247,9 +299,14 @@ def generate_maintenance_report(model, test_df, preprocessor, sequence_length=24
             
             pred, quantiles, feature_weights = model(sequences, static)
             
-            predicted_rul = pred.item()
-            lower_bound = quantiles[0].item()
-            upper_bound = quantiles[2].item()
+            # Inverse transform predictions to original scale
+            predicted_rul_scaled = pred.cpu().numpy()
+            lower_bound_scaled = quantiles[0].cpu().numpy()
+            upper_bound_scaled = quantiles[2].cpu().numpy()
+            
+            predicted_rul = preprocessor.inverse_transform_rul(predicted_rul_scaled)[0]
+            lower_bound = preprocessor.inverse_transform_rul(lower_bound_scaled)[0]
+            upper_bound = preprocessor.inverse_transform_rul(upper_bound_scaled)[0]
         
         # Get current status
         health_status = calculate_health_status(predicted_rul)
@@ -272,6 +329,7 @@ def generate_maintenance_report(model, test_df, preprocessor, sequence_length=24
         }
         
         report_data.append(report_entry)
+        machines_processed += 1
         
         # Print machine report
         print(f"\n🔧 Machine: {machine_id}")
@@ -287,6 +345,10 @@ def generate_maintenance_report(model, test_df, preprocessor, sequence_length=24
         else:
             print(f"   ✓  GOOD: Machine operating normally")
     
+    if machines_skipped > 0:
+        print(f"\n⚠️  Reasons for skipped machines:")
+        for reason in skip_reasons:
+            print(f"   • {reason}")
     print("\n" + "="*60 + "\n")
     
     return pd.DataFrame(report_data)
@@ -321,6 +383,19 @@ def main():
         train_df, val_df, test_df, sequence_length, prediction_horizon
     )
     
+    if DEVICE.type == 'cuda':
+        # Check GPU memory
+        gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        if gpu_mem_gb > 40:  # A100 has 40GB or 80GB
+            batch_size = 256  # Large batch for A100
+            print(f"🚀 A100 GPU detected ({gpu_mem_gb:.0f}GB): Using batch_size={batch_size}")
+        else:
+            batch_size = 128
+            print(f"🎮 GPU detected ({gpu_mem_gb:.0f}GB): Using batch_size={batch_size}")
+    else:
+        batch_size = 32
+        print(f"Using batch_size={batch_size}")
+        
     # Create dataloaders
     batch_size = 32
     train_loader, val_loader, test_loader = create_dataloaders(
@@ -360,7 +435,7 @@ def main():
     predictions, uncertainties, targets = evaluate_model(model, test_loader, preprocessor)
     
     # Plot results
-    plot_results(predictions, targets, uncertainties)
+    plot_path = plot_results(predictions, targets, uncertainties)
     
     # Generate maintenance report
     maintenance_report = generate_maintenance_report(
@@ -370,15 +445,24 @@ def main():
     # Save report
     report_path = 'maintenance_report.csv'
     maintenance_report.to_csv(report_path, index=False)
-    print(f"✓ Maintenance report saved to: {report_path}")
+    
+    # Save report
+    if len(maintenance_report) > 0:
+        report_path = 'maintenance_report.csv'
+        maintenance_report.to_csv(report_path, index=False)
+        print(f"✓ Maintenance report saved to: {os.path.abspath(report_path)}")
+        print(f"  Total machines in report: {len(maintenance_report)}")
+    else:
+        print(f"⚠️  WARNING: No machines were successfully processed for maintenance report")
     
     print("\n" + "="*60)
     print("✅ PIPELINE COMPLETE!")
     print("="*60)
-    print("\nGenerated files in current directory:")
-    print("  • best_tft_model.pth - Trained model weights")
-    print("  • prediction_results.png - Visualization of predictions")
-    print("  • maintenance_report.csv - Maintenance recommendations")
+    print("\nGenerated files:")
+    print(f"  • {os.path.abspath('best_tft_model.pth')} - Trained model weights")
+    print(f"  • {plot_path} - Visualization of predictions")
+    if len(maintenance_report) > 0:
+        print(f"  • {os.path.abspath(report_path)} - Maintenance recommendations")
     
 
 if __name__ == "__main__":
